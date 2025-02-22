@@ -15,9 +15,12 @@ import {
   toSchemasContainer,
   validate,
 } from '@prisma/internals'
+import fs from 'fs-jetpack'
 import { bold, dim, green, red } from 'kleur/colors'
 import prompt from 'prompts'
 
+import { DbPull } from '../commands/DbPull'
+import { MigrateResolve } from '../commands/MigrateResolve'
 import { Migrate } from '../Migrate'
 import type { EngineResults } from '../types'
 import type { DatasourceInfo } from '../utils/ensureDatabaseExists'
@@ -77,8 +80,8 @@ ${bold('Examples')}
       '-h': '--help',
       '--name': String,
       '-n': '--name',
-      // '--force': Boolean,
-      // '-f': '--force',
+      '--force': Boolean,
+      '-f': '--force',
       '--create-only': Boolean,
       '--schema': String,
       '--config': String,
@@ -136,7 +139,49 @@ ${bold('Examples')}
     const migrationIdsApplied: string[] = []
 
     if (devDiagnostic.action.tag === 'reset') {
-      this.logResetReason({
+      if (!args['--force']) {
+        if (!canPrompt()) {
+          migrate.stop()
+          throw new MigrateDevEnvNonInteractiveError()
+        }
+
+        const confirmedReset = await this.confirmReset({
+          _datasourceInfo: datasourceInfo,
+          _reason: devDiagnostic.action.reason,
+        })
+
+        process.stdout.write('\n')
+
+        if (confirmedReset === 'cancel') {
+          process.stdout.write('Operation cancelled.\n')
+          migrate.stop()
+          process.exit(130)
+        } else if (confirmedReset === 'baseline') {
+          process.stdout.write('Baselining the database...\n')
+          try {
+            await DbPull.new().parse(['--schema', schemaPath], config)
+            await MigrateDev.new().parse(['--create-only', '--schema', schemaPath], config) // Added config
+            const migrationDirs = await fs.listAsync('prisma/migrations')
+            if (!migrationDirs || migrationDirs.length === 0) {
+              throw new Error('No migrations found')
+            }
+            const latestMigration = migrationDirs.sort().reverse()[0]
+            await MigrateResolve.new().parse(['--applied', latestMigration, '--schema', schemaPath], config)
+          } catch (e) {
+            migrate.stop()
+            throw e
+          }
+        } else if (confirmedReset === 'reset') {
+          process.stdout.write('Resetting the database...\n')
+          try {
+            await migrate.reset()
+          } catch (e) {
+            migrate.stop()
+            throw e
+          }
+        }
+      }
+      await this.logResetReason({
         datasourceInfo,
         reason: devDiagnostic.action.reason,
       })
@@ -211,7 +256,7 @@ ${bold('Examples')}
 
       process.stdout.write(bold(`\n⚠️  Warnings for the current datasource:\n\n`))
       for (const warning of evaluateDataLossResult.warnings) {
-        process.stdout.write(`  • ${warning.message}\n`)
+        process.stdout.write(`   • ${bold(red(warning.message))}\n`)
       }
       process.stdout.write('\n') // empty line
 
@@ -336,7 +381,17 @@ ${green('Your database is now in sync with your schema.')}\n`,
     return ''
   }
 
-  private logResetReason({ datasourceInfo, reason }: { datasourceInfo: DatasourceInfo; reason: string }) {
+  private async confirmReset({
+    _datasourceInfo,
+    _reason,
+  }: {
+    _datasourceInfo: DatasourceInfo
+    _reason: string
+  }): Promise<'baseline' | 'reset' | 'cancel'> {
+    return Promise.resolve('cancel')
+  }
+
+  private async logResetReason({ datasourceInfo, reason }: { datasourceInfo: DatasourceInfo; reason: string }) {
     // Log the reason of why a reset is needed to the user
     process.stdout.write(reason + '\n')
 
@@ -358,12 +413,37 @@ ${green('Your database is now in sync with your schema.')}\n`,
       message += ` at "${datasourceInfo.dbLocation}"`
     }
 
-    process.stdout.write(`${message}\n`)
+    const messageForPrompt = `${message}
+Do you want to continue? ${red('All data will be lost')}.
+You have two options:
+1. Baseline (non-destructive): Keep the current database structure and create new migrations.
+2. Reset (destructive): Reset the database schema and apply all migrations.`
+
+    // For testing purposes we log the message
+    // An alternative would be to find a way to capture the prompt message from jest tests
+    // (attempted without success)
+    if (Boolean((prompt as any)._injected?.length) === true) {
+      process.stdout.write(messageForPrompt + '\n')
+    }
+    const confirmation = await prompt({
+      type: 'select',
+      name: 'action',
+      message: messageForPrompt,
+      choices: [
+        { title: 'Baseline (non-destructive)', value: 'baseline' },
+        { title: 'Reset (destructive)', value: 'reset' },
+        { title: 'Cancel', value: 'cancel' },
+      ],
+    })
+
+    return confirmation.action
   }
+
+  // Duplicate function implementation removed
 
   public help(error?: string): string | HelpError {
     if (error) {
-      return new HelpError(`\n${bold(red(`!`))} ${error}\n${MigrateDev.help}`)
+      return new HelpError(`\n${bold(red('!'))} ${error}\n${MigrateDev.help}`)
     }
     return MigrateDev.help
   }
